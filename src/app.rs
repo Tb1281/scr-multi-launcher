@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use iced::{
     Background, Border, Color, Element, Font, Length, Subscription, Task, border,
@@ -7,11 +10,13 @@ use iced::{
         text,
     },
 };
-use windows::Win32::System::Threading::TerminateProcess;
 
 use crate::{
-    KOREAN_FONT, SCRStruct,
-    scr::{StringExt, get_owned_handle, get_path, process_handles, query_child, run_scr, save_log},
+    KOREAN_FONT,
+    scr::{
+        StringExt, check_processes_worker, get_path_async, kill_processes_async, run_scr_async,
+        save_log,
+    },
     settings::Settings,
 };
 
@@ -22,19 +27,20 @@ const SEARCH: &[u8] = include_bytes!("../assets/search-svgrepo-com.svg");
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
-
-    ProcessCheckResult(Vec<SCRStruct>, Vec<String>),
+    ProcessCheckResult((BTreeMap<u32, bool>, Vec<String>)),
     ProcessLog(Option<String>),
     KillAll,
+    KilledAll((BTreeMap<u32, bool>, Vec<String>)),
     RunSCR(String),
     SaveLogs,
+    LogsSaved(Result<BTreeSet<String>, String>),
     ClearLogs,
     OpenSettings,
-    CmdResult(Result<(), String>),
 
-    // 설정 다이얼로그 메시지
     OpenFolderDialog32,
+    PathSelected32(Option<String>),
     OpenFolderDialog64,
+    PathSelected64(Option<String>),
     SaveSettings,
     SaveSettingsResult(Result<Settings, String>),
     CloseSettings,
@@ -42,8 +48,9 @@ pub enum Message {
 
 pub struct App {
     is_timer_on: bool,
+    is_checking: bool,
     show_settings: bool,
-    childs: BTreeSet<SCRStruct>,
+    childs: BTreeMap<u32, bool>, // 락(Lock) 없이 순수 데이터만 보유
     logs: BTreeSet<String>,
     settings: Settings,
     temp_settings: Settings,
@@ -51,7 +58,6 @@ pub struct App {
 
 impl App {
     pub fn new(maybe_settings: Option<Settings>) -> Self {
-        let childs = BTreeSet::new();
         let mut logs = BTreeSet::new();
         let settings = if let Some(settings) = maybe_settings {
             settings
@@ -63,8 +69,9 @@ impl App {
 
         Self {
             is_timer_on: true,
+            is_checking: false,
             show_settings: false,
-            childs,
+            childs: BTreeMap::new(),
             settings,
             temp_settings,
             logs,
@@ -72,115 +79,95 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(CHECK_INTERVAL).map(|_| Message::Tick)
+        if self.is_timer_on {
+            iced::time::every(CHECK_INTERVAL).map(|_| Message::Tick)
+        } else {
+            Subscription::none()
+        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Tick => {
-                let childs = std::mem::take(&mut self.childs);
-                Task::perform(
-                    async move {
-                        let mut new_childs = process_handles();
-                        let mut logs = Vec::new();
-                        new_childs.extend(childs);
-
-                        new_childs.retain_mut(|child| {
-                            if child.is_processed {
-                                if get_owned_handle(child.pid).is_none() {
-                                    logs.push(format!("Invalid PID: {}", child.pid).as_log());
-
-                                    false
-                                } else {
-                                    true
-                                }
-                            } else if let Some(log) = query_child(child.pid, None) {
-                                child.is_processed = true;
-                                logs.push(log);
-
-                                true
-                            } else {
-                                true
-                            }
-                        });
-
-                        (new_childs, logs)
-                    },
-                    |(new_childs, logs)| Message::ProcessCheckResult(new_childs, logs),
-                )
-            }
-            Message::ProcessCheckResult(new_childs, logs) => {
-                self.childs.extend(new_childs);
-                self.logs.extend(logs);
-                if !self.is_timer_on {
-                    self.kill_childs();
-                    self.is_timer_on = true;
+                if self.is_checking {
+                    return Task::none();
                 }
 
+                self.is_checking = true;
+                // UI에서 소유권을 완전히 빼서 워커로 던집니다. (Clone 없음)
+                let childs = std::mem::take(&mut self.childs);
+
+                Task::perform(check_processes_worker(childs), Message::ProcessCheckResult)
+            }
+            Message::ProcessCheckResult((returned_childs, logs)) => {
+                self.is_checking = false;
+                self.childs = returned_childs; // 워커가 돌려준 맵으로 원상복구
+                self.logs.extend(logs);
                 Task::none()
             }
-            Message::RunSCR(path) => Task::perform(
-                async move {
-                    if let Some((pid, handle)) = run_scr(&path, &["-launch"]) {
-                        let log = query_child(pid, Some(handle));
-
-                        log
-                    } else {
-                        None
-                    }
-                },
-                |maybe_log| Message::ProcessLog(maybe_log),
-            ),
+            Message::RunSCR(path) => {
+                let args = vec!["-launch".to_string()];
+                Task::perform(run_scr_async(path, args), Message::ProcessLog)
+            }
             Message::KillAll => {
                 self.is_timer_on = false;
-                self.kill_childs();
+                let childs = std::mem::take(&mut self.childs);
 
+                Task::perform(kill_processes_async(childs), Message::KilledAll)
+            }
+            Message::KilledAll((returned_childs, logs)) => {
+                self.childs = returned_childs;
+                self.logs.extend(logs);
+                self.is_timer_on = true;
                 Task::none()
             }
             Message::ProcessLog(maybe_log) => {
                 if let Some(log) = maybe_log {
-                    self.logs.insert(log.as_log());
+                    self.logs.insert(log);
                 }
-
                 Task::none()
             }
-            Message::OpenFolderDialog32 => {
-                if let Some(path_32) = get_path() {
-                    self.temp_settings.path_32 = path_32;
+            Message::OpenFolderDialog32 => Task::perform(get_path_async(), Message::PathSelected32),
+            Message::PathSelected32(maybe_path) => {
+                if let Some(path) = maybe_path {
+                    self.temp_settings.path_32 = path;
                 }
-
                 Task::none()
             }
-            Message::OpenFolderDialog64 => {
-                if let Some(path_64) = get_path() {
-                    self.temp_settings.path_64 = path_64;
+            Message::OpenFolderDialog64 => Task::perform(get_path_async(), Message::PathSelected64),
+            Message::PathSelected64(maybe_path) => {
+                if let Some(path) = maybe_path {
+                    self.temp_settings.path_64 = path;
                 }
-
                 Task::none()
             }
             Message::SaveLogs => {
-                let logs = std::mem::take(&mut self.logs);
-                Task::perform(save_log(logs), Message::CmdResult)
+                // logs의 소유권 이동 (Zero-Clone)
+                let logs_to_save = std::mem::take(&mut self.logs);
+                Task::perform(save_log(logs_to_save), Message::LogsSaved)
             }
-            Message::CmdResult(result) => {
-                if let Err(err) = result {
-                    self.logs.insert(err.as_log());
+            Message::LogsSaved(result) => {
+                match result {
+                    Ok(returned_logs) => {
+                        let current_new_logs = std::mem::take(&mut self.logs);
+                        self.logs = returned_logs;
+                        self.logs.extend(current_new_logs);
+                    }
+                    Err(err) => {
+                        self.logs.insert(err.as_log());
+                    }
                 }
                 Task::none()
             }
             Message::OpenSettings => {
                 self.show_settings = true;
                 self.temp_settings = self.settings.clone();
-
-                iced::widget::focus_next()
+                Task::none() // Iced 0.14: 불필요한 focus_next 제거
             }
             Message::SaveSettings => {
                 self.show_settings = false;
-
-                Task::perform(
-                    std::mem::take(&mut self.temp_settings).save(),
-                    Message::SaveSettingsResult,
-                )
+                let temp = self.temp_settings.clone();
+                Task::perform(temp.save(), Message::SaveSettingsResult)
             }
             Message::SaveSettingsResult(result) => {
                 match result {
@@ -189,51 +176,29 @@ impl App {
                         self.logs.insert(err.as_log());
                     }
                 }
-
                 Task::none()
             }
             Message::CloseSettings => {
                 self.show_settings = false;
-
                 Task::none()
             }
             Message::ClearLogs => {
                 self.logs.clear();
-
                 Task::none()
             }
         }
     }
 
-    pub fn view(&self) -> Element<Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let content = self.main_view();
         if self.show_settings {
             modal(content, self.settings_view(), Message::CloseSettings)
         } else {
-            content.into()
+            content
         }
     }
 
-    fn kill_childs(&mut self) -> () {
-        self.childs.retain(|child| {
-            if let Some(handle) = get_owned_handle(child.pid) {
-                match unsafe { TerminateProcess(*handle, 0) } {
-                    Ok(_) => {
-                        self.logs.insert(
-                            format!("Successfully terminated process wid PID {}", child.pid)
-                                .as_log(),
-                        );
-                        false
-                    }
-                    _ => true,
-                }
-            } else {
-                false
-            }
-        });
-    }
-
-    fn main_view(&self) -> Element<Message> {
+    fn main_view(&self) -> Element<'_, Message> {
         let run_32 = if self.settings.path_32.is_empty() {
             button("32bit").padding([8, 24])
         } else {
@@ -246,11 +211,10 @@ impl App {
             button("64bit").padding([8, 24])
         } else {
             button("64bit")
-                .on_press(Message::RunSCR(self.settings.path_32.clone()))
+                .on_press(Message::RunSCR(self.settings.path_64.clone()))
                 .padding([8, 24])
         };
 
-        // 상단 버튼 행
         let top_row = row![
             button(
                 svg(iced::widget::svg::Handle::from_memory(GEAR)).style(|_, _| svg::Style {
@@ -261,18 +225,17 @@ impl App {
             .height(36)
             .padding(2)
             .on_press(Message::OpenSettings),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             run_32,
-            Space::with_width(Length::Fixed(12.0)),
+            Space::new().width(Length::Fixed(12.0)),
             run_64,
-            Space::with_width(Length::Fixed(12.0)),
+            Space::new().width(Length::Fixed(12.0)),
             button("Kill All")
                 .on_press(Message::KillAll)
                 .padding([8, 16]),
         ]
         .align_y(iced::Alignment::Center);
 
-        // 로그 영역
         let logs_colum = column(self.logs.iter().map(|log| text(log).size(12).into()));
         let logs_area = container(scrollable(logs_colum))
             .style(|_theme| container::Style {
@@ -288,13 +251,12 @@ impl App {
             .height(Length::Fill)
             .padding(4);
 
-        // 하단 버튼 행
         let bottom_row = row![
             button(text("Save Logs").center())
                 .on_press(Message::SaveLogs)
                 .width(Length::Fill)
                 .padding(8),
-            Space::with_width(Length::Fixed(8.0)),
+            Space::new().width(Length::Fixed(8.0)),
             button(text("Clear Logs").center())
                 .on_press(Message::ClearLogs)
                 .width(Length::Fill)
@@ -307,14 +269,14 @@ impl App {
             .into()
     }
 
-    fn settings_view(&self) -> Element<Message> {
+    fn settings_view(&self) -> Element<'_, Message> {
         let dialog_content = column![
             text("설정").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
                 family: KOREAN_FONT.family,
                 ..Default::default()
             }),
-            Space::with_height(Length::Fixed(12.0)),
+            Space::new().height(Length::Fixed(12.0)),
             text("32bit").size(16).font(Font {
                 weight: iced::font::Weight::Bold,
                 family: KOREAN_FONT.family,
@@ -333,10 +295,8 @@ impl App {
                     .width(Length::Fill)
                     .padding([8, 4]),
                 button(
-                    svg(iced::widget::svg::Handle::from_memory(SEARCH)).style(|_, _| {
-                        svg::Style {
-                            color: Some(Color::WHITE),
-                        }
+                    svg(iced::widget::svg::Handle::from_memory(SEARCH)).style(|_, _| svg::Style {
+                        color: Some(Color::WHITE)
                     })
                 )
                 .width(36)
@@ -346,7 +306,7 @@ impl App {
             ]
             .spacing(4)
             .align_y(iced::Alignment::Center),
-            Space::with_height(Length::Fixed(8.0)),
+            Space::new().height(Length::Fixed(8.0)),
             text("64bit").font(Font {
                 weight: iced::font::Weight::Bold,
                 family: KOREAN_FONT.family,
@@ -376,13 +336,13 @@ impl App {
             ]
             .spacing(4)
             .align_y(iced::Alignment::Center),
-            Space::with_height(Length::Fixed(12.0)),
+            Space::new().height(Length::Fixed(12.0)),
             row![
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 button("확인")
                     .on_press(Message::SaveSettings)
                     .padding([8, 16]),
-                Space::with_width(Length::Fixed(16.0)),
+                Space::new().width(Length::Fixed(16.0)),
                 button("취소")
                     .on_press(Message::CloseSettings)
                     .padding([8, 16]),
@@ -391,15 +351,13 @@ impl App {
         ]
         .padding(8);
 
-        // 배경 오버레이
-        let overlay = container(dialog_content)
+        container(dialog_content)
             .style(|_| container::Style {
                 background: Some(Background::Color(Color::WHITE)),
                 ..Default::default()
             })
-            .width(Length::Fixed(360.0));
-
-        overlay.into()
+            .width(Length::Fixed(360.0))
+            .into()
     }
 }
 
