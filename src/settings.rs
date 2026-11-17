@@ -39,14 +39,21 @@ impl Settings {
         let path = load_path().await;
         let buffer = read_to_string(&path)
             .await
-            .map_err(|err| format!("{} 파일을 읽을 수 없습니다: {}", path.display(), err))?;
+            .map_err(|err| format!("conf.toml 읽기 실패: {}", err))?;
 
         toml::from_str(&buffer).map_err(|err| {
-            format!(
-                "{} 파싱에 실패했습니다. Windows 경로의 역슬래시는 \\\\로 쓰거나 작은따옴표('...')로 감싸세요.\n{}",
-                path.display(),
-                err
-            )
+            let line = err.span().map(|span| {
+                buffer.as_bytes()[..span.start.min(buffer.len())]
+                    .iter()
+                    .filter(|&&byte| byte == b'\n')
+                    .count()
+                    + 1
+            });
+
+            match line {
+                Some(line) => format!("conf.toml 형식 오류 ({}행): {}", line, err.message()),
+                None => format!("conf.toml 형식 오류: {}", err.message()),
+            }
         })
     }
 
@@ -60,13 +67,7 @@ impl Settings {
         )
         .await
         .map(|_| self)
-        .map_err(|err| {
-            format!(
-                "{} 파일을 저장할 수 없습니다: {} (실행 파일이 있는 폴더의 쓰기 권한을 확인하세요)",
-                path.display(),
-                err
-            )
-        })
+        .map_err(|err| format!("conf.toml 저장 실패: {}", err))
     }
 }
 
