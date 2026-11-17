@@ -1,7 +1,11 @@
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals)]
 
 use chrono::Local;
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem::size_of,
+    os::windows::ffi::OsStrExt,
+};
 use windows::{
     Wdk::{
         Foundation::{NtQueryObject, OBJECT_INFORMATION_CLASS, OBJECT_NAME_INFORMATION},
@@ -23,13 +27,14 @@ use windows::{
             },
             Threading::{
                 CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CreateMutexW, CreateProcessW,
-                GetCurrentProcess, OpenProcess, PROCESS_ALL_ACCESS, PROCESS_INFORMATION,
-                STARTUPINFOW, TerminateProcess,
+                GetCurrentProcess, IsWow64Process, OpenProcess, PROCESS_DUP_HANDLE,
+                PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, STARTUPINFOW,
+                TerminateProcess,
             },
         },
         UI::Shell::{Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileDialog, SIGDN_FILESYSPATH},
     },
-    core::{HSTRING, Owned, PCWSTR, PWSTR, w},
+    core::{BOOL, HSTRING, Owned, PCWSTR, PWSTR, w},
 };
 
 use crate::APP_NAME;
@@ -154,7 +159,14 @@ pub async fn save_log(mut logs: BTreeSet<String>) -> Result<BTreeSet<String>, St
 }
 
 fn get_owned_handle(pid: u32) -> Option<Owned<HANDLE>> {
-    unsafe { Owned::new(OpenProcess(PROCESS_ALL_ACCESS, false, pid).ok()?) }.into()
+    unsafe {
+        Owned::new(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, false, pid).ok()?)
+    }
+    .into()
+}
+
+fn get_terminate_handle(pid: u32) -> Option<Owned<HANDLE>> {
+    unsafe { Owned::new(OpenProcess(PROCESS_TERMINATE, false, pid).ok()?) }.into()
 }
 
 fn process_handles() -> Vec<u32> {
@@ -341,38 +353,146 @@ pub async fn check_processes_worker(
     .unwrap_or_else(|_| (BTreeMap::new(), Vec::new()))
 }
 
-pub async fn run_scr_async(path: String, args: Vec<String>) -> Option<String> {
-    tokio::task::spawn_blocking(move || {
-        let mut cmd = vec![path.as_str()];
-        cmd.extend(args.iter().map(|s| s.as_str()));
-        let mut process_info = PROCESS_INFORMATION::default();
-        let startup_info = STARTUPINFOW::default();
+fn exe_architecture(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::{Read, Seek, SeekFrom};
 
-        let owned_handle = unsafe {
-            if CreateProcessW(
-                None,
-                Some(PWSTR(HSTRING::from(cmd.join(" ")).as_ptr() as *mut _)),
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut dos_header = [0u8; 64];
+    file.read_exact(&mut dos_header).ok()?;
+    if &dos_header[0..2] != b"MZ" {
+        return None;
+    }
+
+    let pe_offset = u32::from_le_bytes(dos_header[0x3c..0x40].try_into().ok()?) as u64;
+    file.seek(SeekFrom::Start(pe_offset)).ok()?;
+
+    let mut pe_header = [0u8; 6];
+    file.read_exact(&mut pe_header).ok()?;
+    if &pe_header[0..4] != b"PE\0\0" {
+        return None;
+    }
+
+    match u16::from_le_bytes([pe_header[4], pe_header[5]]) {
+        0x014c => Some("32비트 (x86)"),
+        0x8664 => Some("64비트 (x64)"),
+        0xaa64 => Some("ARM64"),
+        _ => Some("알 수 없는 아키텍처"),
+    }
+}
+
+fn process_architecture(process: HANDLE) -> Option<&'static str> {
+    let mut is_wow64 = BOOL(0);
+    unsafe { IsWow64Process(process, &mut is_wow64) }.ok()?;
+
+    Some(if is_wow64.as_bool() {
+        "32비트 (WOW64)"
+    } else {
+        "64비트"
+    })
+}
+
+pub async fn run_scr_async(path: String, args: Vec<String>) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut logs = Vec::new();
+
+        let exe_path = std::path::Path::new(&path);
+        if !exe_path.is_file() {
+            logs.push(format!("실행 파일을 찾을 수 없습니다: {}", path).as_log());
+            return logs;
+        }
+
+        // 어떤 아키텍처의 실행 파일을 선택했는지 로그로 남긴다.
+        logs.push(
+            format!(
+                "실행 파일: {} [{}]",
+                path,
+                exe_architecture(exe_path).unwrap_or("알 수 없음")
+            )
+            .as_log(),
+        );
+
+        // CreateProcessW가 lpCommandLine을 수정할 수 있으므로 쓰기 가능한 버퍼를 넘긴다.
+        // 경로를 따옴표로 감싸 공백이 포함된 경로(Program Files 등)를 안전하게 처리한다.
+        let mut command_line: Vec<u16> = std::iter::once(format!("\"{}\"", path))
+            .chain(args)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let application: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let current_dir: Vec<u16> = std::path::Path::new(&path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.as_os_str().encode_wide().chain(Some(0)).collect())
+            .unwrap_or_default();
+
+        let mut process_info = PROCESS_INFORMATION::default();
+        let startup_info = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
+
+        let created = unsafe {
+            CreateProcessW(
+                PCWSTR(application.as_ptr()),
+                Some(PWSTR(command_line.as_mut_ptr())),
                 None,
                 None,
                 false,
                 CREATE_NO_WINDOW | CREATE_NEW_CONSOLE,
                 None,
-                None,
+                if current_dir.is_empty() {
+                    PCWSTR::null()
+                } else {
+                    PCWSTR(current_dir.as_ptr())
+                },
                 &startup_info,
                 &mut process_info,
             )
-            .is_err()
-            {
-                return None;
-            }
-            let _ = CloseHandle(process_info.hThread);
-            Owned::new(process_info.hProcess)
         };
 
-        query_child(process_info.dwProcessId, Some(owned_handle))
+        if let Err(err) = created {
+            logs.push(
+                format!(
+                    "StarCraft.exe 실행 실패 (경로: {}): {} [{}]",
+                    path,
+                    err.message(),
+                    err.code()
+                )
+                .as_log(),
+            );
+            return logs;
+        }
+
+        let pid = process_info.dwProcessId;
+        logs.push(format!("StarCraft.exe 실행 성공 (PID: {})", pid).as_log());
+        if let Some(architecture) = process_architecture(process_info.hProcess) {
+            logs.push(format!("실행된 프로세스 아키텍처: {}", architecture).as_log());
+        }
+        let _ = unsafe { CloseHandle(process_info.hThread) };
+
+        // 게임이 뮤텍스를 만드는 데 시간이 걸리므로 잠시 재시도한다.
+        let mut owned_handle = Some(unsafe { Owned::new(process_info.hProcess) });
+        for _ in 0..5 {
+            if let Some(log) = query_child(pid, owned_handle.take()) {
+                logs.push(log);
+                return logs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        logs.push(
+            format!(
+                "PID {}의 인스턴스 뮤텍스를 아직 찾지 못했습니다. 주기적 검사에서 계속 시도합니다.",
+                pid
+            )
+            .as_log(),
+        );
+        logs
     })
     .await
-    .unwrap_or(None)
+    .unwrap_or_else(|err| vec![format!("StarCraft.exe 실행 작업 실패: {}", err).as_log()])
 }
 
 pub async fn kill_processes_async(
@@ -382,7 +502,7 @@ pub async fn kill_processes_async(
         let mut logs = Vec::new();
 
         for &pid in childs.keys() {
-            if let Some(handle) = get_owned_handle(pid)
+            if let Some(handle) = get_terminate_handle(pid)
                 && unsafe { TerminateProcess(*handle, 0) }.is_ok()
             {
                 logs.push(format!("Successfully terminated process with PID {}", pid).as_log());

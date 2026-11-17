@@ -28,7 +28,7 @@ const SEARCH: &[u8] = include_bytes!("../assets/search-svgrepo-com.svg");
 pub enum Message {
     Tick,
     ProcessCheckResult((BTreeMap<u32, bool>, Vec<String>)),
-    ProcessLog(Option<String>),
+    ProcessLog(Vec<String>),
     KillAll,
     KilledAll((BTreeMap<u32, bool>, Vec<String>)),
     RunSCR(String),
@@ -57,13 +57,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(maybe_settings: Option<Settings>) -> Self {
+    pub fn new(maybe_settings: Result<Settings, String>) -> Self {
         let mut logs = BTreeSet::new();
-        let settings = if let Some(settings) = maybe_settings {
-            settings
-        } else {
-            logs.insert("conf.toml 파일이 없거나 손상되었습니다.".as_log());
-            Settings::default()
+        let settings = match maybe_settings {
+            Ok(settings) => settings,
+            Err(err) => {
+                logs.insert(err.as_log());
+                Settings::default()
+            }
         };
         let temp_settings = settings.clone();
 
@@ -121,10 +122,8 @@ impl App {
                 self.is_timer_on = true;
                 Task::none()
             }
-            Message::ProcessLog(maybe_log) => {
-                if let Some(log) = maybe_log {
-                    self.logs.insert(log);
-                }
+            Message::ProcessLog(logs) => {
+                self.logs.extend(logs);
                 Task::none()
             }
             Message::OpenFolderDialog32 => Task::perform(get_path_async(), Message::PathSelected32),
@@ -166,15 +165,13 @@ impl App {
             }
             Message::SaveSettings => {
                 self.show_settings = false;
-                let temp = self.temp_settings.clone();
-                Task::perform(temp.save(), Message::SaveSettingsResult)
+                // 디스크 저장이 실패하더라도 이번 세션에서는 설정이 적용되도록 즉시 반영한다.
+                self.settings = self.temp_settings.clone();
+                Task::perform(self.settings.clone().save(), Message::SaveSettingsResult)
             }
             Message::SaveSettingsResult(result) => {
-                match result {
-                    Ok(settings) => self.settings = settings,
-                    Err(err) => {
-                        self.logs.insert(err.as_log());
-                    }
+                if let Err(err) = result {
+                    self.logs.insert(err.as_log());
                 }
                 Task::none()
             }

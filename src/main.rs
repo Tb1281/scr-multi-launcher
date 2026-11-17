@@ -15,8 +15,8 @@ fn main() -> iced::Result {
     if get_mutex() {
         iced::application(
             || {
-                let maybe_settings = iced::futures::executor::block_on(Settings::load());
-                (App::new(maybe_settings), Task::none())
+                let settings = iced::futures::executor::block_on(Settings::load());
+                (App::new(settings), Task::none())
             },
             App::update,
             App::view,
